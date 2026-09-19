@@ -1,0 +1,6 @@
+import { createHotContext as __vite__createHotContext } from "/@vite/client";import.meta.hot = __vite__createHotContext("/src/style.css");import { updateStyle as __vite__updateStyle, removeStyle as __vite__removeStyle } from "/@vite/client"
+const __vite__id = "/tmp/coze-phaser-runtime/7fe412f96839f49b/linux-x64-abi127/src/style.css"
+const __vite__css = ":root {\n  color-scheme: dark;\n  font-family: Arial, sans-serif;\n  background: #000;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nhtml,\nbody,\n#game {\n  width: 100%;\n  height: 100%;\n  margin: 0;\n  overflow: hidden;\n  background: #000;\n}\n\n#game {\n  min-width: 0;\n  min-height: 0;\n}\n\n#game canvas {\n  display: block;\n  image-rendering: auto;\n}\n"
+__vite__updateStyle(__vite__id, __vite__css)
+import.meta.hot.accept()
+import.meta.hot.prune(() => __vite__removeStyle(__vite__id))
