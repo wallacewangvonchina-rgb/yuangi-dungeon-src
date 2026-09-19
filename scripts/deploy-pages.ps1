@@ -1,6 +1,8 @@
 ﻿# 一键重新发布到 GitHub Pages
 # 用法（必须 -File 调用）:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deploy-pages.ps1 -Message "改了什么"
+# 先拉远端最新源码再发布（Coze / 其他机器改完后的一条命令闭环）:
+#   ... -File scripts\deploy-pages.ps1 -Pull -Message "改了什么"
 # 安全演练（不碰线上仓库、不 push）:
 #   ... -File scripts\deploy-pages.ps1 -Stage <临时目录> -Dist <临时产物> -SkipBuild -NoPush
 param(
@@ -8,7 +10,8 @@ param(
   [string]$Stage = "",
   [string]$Dist = "",
   [switch]$NoPush,
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [switch]$Pull
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +33,18 @@ Write-Host "proj  = $proj"
 Write-Host "dist  = $dist"
 Write-Host "stage = $stage"
 if (-not (Test-Path (Join-Path $stage '.git'))) { throw "发布仓库未初始化: $stage" }
+
+# ---------- 0. 可选：先拉取远端最新源码 ----------
+if ($Pull) {
+  Push-Location $proj
+  try {
+    git rev-parse --git-dir *> $null
+    if ($LASTEXITCODE -ne 0) { throw "源码目录不是 git 仓库，无法 -Pull : $proj" }
+    git pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw 'git pull 失败（通常是有未提交改动），请先处理，不要强行覆盖' }
+    Write-Host "pulled -> $(git rev-parse --short HEAD)"
+  } finally { Pop-Location }
+}
 
 # ---------- 1. 构建 ----------
 if (-not $SkipBuild) {
