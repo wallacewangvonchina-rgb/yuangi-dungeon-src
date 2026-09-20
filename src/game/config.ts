@@ -27,11 +27,14 @@ export const PLAYER_INVULN_MS = 550;
 
 /**
  * 过层回血比例（占最大生命的比例）。
- * 实测：L1 掉 40 / L2 掉 51 / L3 开场 3.5s 即死，全程承伤 118 > 最大生命 100。
- * 而全游戏只有「嗜血斩」和「生命之心」卡两个回血来源，过层完全不回血 —— 数学上必死。
- * 三层各回 30% 才能把总承伤压回可完成的区间。
+ * 实测（scripts/measure.cjs，固定 seed=12345，机器人打法）：
+ *   L1 承伤 40~48 / L2 承伤 58~59 / L3 承伤 60~72（每次都在 L3 阵亡）。
+ *   三层合计 166~171，而 30% 回复给到的总资源池只有 100+30+30=160 —— 差 4~7%，
+ *   连会冲刺躲的机器人也过不去，等于几乎没有容错。
+ * 提到 45% 把资源池做到 190，留出约 15% 余量。
+ * 调参口径：只改这一个数就能整段缩放难度，敌人数值可以不动。
  */
-export const LEVEL_CLEAR_HEAL_RATIO = 0.3;
+export const LEVEL_CLEAR_HEAL_RATIO = 0.45;
 
 /** 受击击退速度（设计基准单位/秒），按指数衰减，衰减系数见 DungeonScene 的 KNOCK_DAMP。 */
 export const KNOCKBACK_SPEED = 780;
@@ -141,8 +144,9 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     name: '史莱姆',
     color: 0x6fce5b,
     hp: 52,
+    // 8 -> 7：L1 是 6 只史莱姆的群战，实测单层承伤 40~48（近半管血），是三层里最贵的一层。
     speed: 140,
-    damage: 8,
+    damage: 7,
     radius: gameUnits(48),
     coins: 5,
     attackCooldownMs: 900,
@@ -180,9 +184,10 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     // 实测(attack=12, 全套招式)：620 经 L3 缩放(1.44) = 893，TTK 20.0s；
     // 这 20s 里 boss 会打出约 18 次接触 = 396 伤害，而玩家最大生命只有 100。
     // 近战化后玩家必须贴脸站桩输出，远程时代的 620/22 变成了数学上的不可胜。
+    // 伤害 14 -> 12：L3 缩放后 20/次，等于每次接触削掉 20% 生命，贴脸打不可接受。
     hp: 420,
     speed: 100,
-    damage: 14,
+    damage: 12,
     radius: gameUnits(120),
     coins: 80,
     attackCooldownMs: 1100,
