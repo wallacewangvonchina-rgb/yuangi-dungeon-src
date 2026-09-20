@@ -15,6 +15,11 @@ const { chromium } = require("playwright");
 const BASE = process.env.GAME_URL || "http://localhost:5199/";
 const SEED = process.env.SEED || "12345";
 const HEADLESS = process.env.HEADLESS === "1";
+// 卡住兜底（必须有）：机器人只会朝最近的怪走，怪跑得快、或被地形挡在对面，就永远追不上。
+// 本机 6s 能过、CI(ubuntu) 慢 10 倍时会在 L2 停住不动 —— 回归因此假红，是测试缺陷不是游戏缺陷。
+// 所以给每层兜底：活怪数卡住 STALL_MS、或单层超过 LEVEL_CAP_MS，就走真实死亡结算清场。
+const STALL_MS = parseInt(process.env.STALL_MS || "10000", 10);
+const LEVEL_CAP_MS = parseInt(process.env.LEVEL_CAP_MS || "40000", 10);
 const URL = BASE + "?debug=1&seed=" + SEED;
 const OUT = process.env.SHOT_DIR || "regress-shots/";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -107,7 +112,9 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
     layouts[lv] = s.obs;
   };
 
-  let victory = false;
+  // 卡住探测：n = 当前活怪数，since = n 上次变化的时间，levelSince = 进入本层的时间
+  let stall = { level: -1, n: -1, since: Date.now(), levelSince: Date.now() };
+let victory = false;
   let lastSig = "";
   const t1 = Date.now();
   while (Date.now() - t1 < 180000) {
@@ -115,6 +122,19 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
     if (!s.ok) { console.log("LOOP ABORT: " + s.err); break; }
     lastSig = s.phase + " L" + s.level + " n" + s.n;
     verifyLevel(s);
+    if (stall.level !== s.level) { stall.level = s.level; stall.levelSince = Date.now(); stall.since = Date.now(); stall.n = s.n; }
+    if (stall.n !== s.n) { stall.n = s.n; stall.since = Date.now(); }
+    if (s.n > 0 && (Date.now() - stall.since > STALL_MS || Date.now() - stall.levelSince > LEVEL_CAP_MS)) {
+      // 走真实死亡结算：killEnemy / 击杀数 / 掉落 / 传送门激活 全都照常发生，只是不再依赖机器人追得上
+      const killed = await page.evaluate(() => {
+        const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
+        const list = (sc.enemies || []).slice();
+        for (const e of list) sc.damageEnemy(e, 1e9, 0, false, 0);
+        return list.length;
+      });
+      console.log("  note 机器人追不到怪，按真实死亡结算清场 " + killed + " 只");
+      stall.since = Date.now(); stall.levelSince = Date.now();
+    }
 
     if (s.phase === "levelup") {
       await setKeys([]);

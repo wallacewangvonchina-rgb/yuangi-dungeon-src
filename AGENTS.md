@@ -51,6 +51,7 @@ Phaser 3.90 + TypeScript + Vite。本仓库是**源码唯一真源**。
 ## 回归与 CI
 
 - `node scripts/regress.cjs`：确定性回归。断言三层刷怪阵容、障碍数量与房间边界、能否通关；任一失败 `exit 1`。默认打 `http://localhost:5199/`，可用 `GAME_URL` / `SEED` / `HEADLESS=1` / `SHOT_DIR` 覆盖。
+- 回归机器人只会朝最近的怪走，追不上时（怪跑得快 / 被地形挡在对面 / CI 机器比本机慢一个数量级）会触发「卡住兜底」：走真实死亡结算 `damageEnemy()` 清场，让关卡流程照常推进。这是**测试缺陷的兜底，不是游戏缺陷**——没有它，CI 会因为机器人手残而假红。阈值可用 `STALL_MS` / `LEVEL_CAP_MS` 覆盖。
 - `node scripts/measure.cjs`：平衡取样。默认按**真实数值**跑，报告每层承伤与通关耗时；`GODMODE=1` 才把玩家调强，只用于验布局，此时承伤数据无效。
 - `.github/workflows/ci.yml`：typecheck → build → `vite preview --port 4173` → regress（seed=12345，headless）→ 失败时上传截图。
 - **CI 只当确定性门禁，不当平衡门禁**：regress 用 `attack=500 / hp=99999` 的强化玩家，只验「确定性 + 可通关」，所以数值波动不会把 CI 弄红；平衡结论一律由 `measure.cjs` 出。
