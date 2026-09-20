@@ -2,6 +2,9 @@
 node_modules/
 dist/
 
+# 回归截图
+regress-shots/
+
 # 日志与本地临时文件
 *.log
 *.local

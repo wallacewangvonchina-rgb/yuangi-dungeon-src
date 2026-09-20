@@ -62,6 +62,7 @@ import {
   type SkillDef,
 } from '@/game/config';
 import { sfx } from '@/game/audio';
+import { rand } from '@/game/rng';
 import {
   applySkill,
   buyUpgrade,
@@ -374,6 +375,11 @@ const drawPortal = (g: Phaser.GameObjects.Graphics): void => {
 
 export class DungeonScene extends Phaser.Scene {
   private phase: Phase = 'menu';
+
+  /** 本层真实刷出的怪种（生成时刻记录，不受后续死亡影响），供自动化回归断言。 */
+  spawnedKinds: EnemyKindId[] = [];
+  /** 本层承伤累计，供数值调参与回归取样。 */
+  levelStats = { level: 0, damageTaken: 0 };
   private run!: RunState;
   private meta!: MetaState;
 
@@ -2361,6 +2367,7 @@ export class DungeonScene extends Phaser.Scene {
     }
     this.invulnUntil = now + PLAYER_INVULN_MS;
     this.run.hp -= amount;
+    this.levelStats.damageTaken += amount;
     // 击退：受伤后被推开，给玩家脱离包围的余地。
     if (fromX !== undefined && fromY !== undefined) {
       const dx = this.playerX - fromX;
@@ -2586,11 +2593,11 @@ export class DungeonScene extends Phaser.Scene {
       const ox =
         WALL_THICKNESS +
         gameUnits(200) +
-        Math.random() * (ROOM_WIDTH - 2 * WALL_THICKNESS - gameUnits(400));
+        rand() * (ROOM_WIDTH - 2 * WALL_THICKNESS - gameUnits(400));
       const oy =
         WALL_THICKNESS +
         gameUnits(200) +
-        Math.random() * (ROOM_HEIGHT - 2 * WALL_THICKNESS - gameUnits(400));
+        rand() * (ROOM_HEIGHT - 2 * WALL_THICKNESS - gameUnits(400));
       if (
         Math.abs(ox - ROOM_WIDTH / 2) < gameUnits(300) &&
         Math.abs(oy - ROOM_HEIGHT / 2) < gameUnits(300)
@@ -2601,9 +2608,9 @@ export class DungeonScene extends Phaser.Scene {
       if (isOnPlatform(ox, oy)) {
         continue;
       }
-      const r = gameUnits(56) + Math.random() * gameUnits(56);
+      const r = gameUnits(56) + rand() * gameUnits(56);
       const og = this.add.graphics().setDepth(2);
-      const variant: ObstacleVariant = Math.random() < 0.5 ? 'crate' : 'pillar';
+      const variant: ObstacleVariant = rand() < 0.5 ? 'crate' : 'pillar';
       drawObstacleProp(og, r, variant);
       og.setPosition(ox, oy);
       this.obstacles.push({ x: ox, y: oy, r, sprite: og });
@@ -2618,6 +2625,9 @@ export class DungeonScene extends Phaser.Scene {
 
   private spawnEnemies(level: number): void {
     const plan = spawnPlanForLevel(level);
+    // 生成时刻就记录怪种：之后有怪被打死也不会影响「这层应该有什么」的断言。
+    this.spawnedKinds = plan.flatMap((spec) => Array.from({ length: spec.count }, () => spec.kind));
+    this.levelStats = { level, damageTaken: 0 };
     const scale = enemyStatScale(level);
     const centerSafe = gameUnits(260);
     for (const spec of plan) {
@@ -2629,11 +2639,11 @@ export class DungeonScene extends Phaser.Scene {
           const tx =
             WALL_THICKNESS +
             gameUnits(120) +
-            Math.random() * (ROOM_WIDTH - 2 * WALL_THICKNESS - gameUnits(240));
+            rand() * (ROOM_WIDTH - 2 * WALL_THICKNESS - gameUnits(240));
           const ty =
             WALL_THICKNESS +
             gameUnits(120) +
-            Math.random() * (ROOM_HEIGHT - 2 * WALL_THICKNESS - gameUnits(240));
+            rand() * (ROOM_HEIGHT - 2 * WALL_THICKNESS - gameUnits(240));
           const awayFromCenter =
             Math.hypot(tx - ROOM_WIDTH / 2, ty - ROOM_HEIGHT / 2) >
             centerSafe + kind.radius;

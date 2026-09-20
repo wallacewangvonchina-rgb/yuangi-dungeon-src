@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 构建
+        run: npm run build
+
+      - name: 安装 Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: 起 preview 服务
+        run: |
+          npx vite preview --port 4173 --strictPort &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4173/ > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:4173/ > /dev/null
+
+      - name: 确定性回归（固定 seed 跑完三层）
+        env:
+          GAME_URL: http://localhost:4173/
+          SEED: '12345'
+          HEADLESS: '1'
+        run: node scripts/regress.cjs
+
+      - name: 失败时上传截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-screenshots
+          path: regress-shots/
+          if-no-files-found: ignore
