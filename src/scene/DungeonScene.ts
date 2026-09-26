@@ -8,6 +8,7 @@ import {
   BLOOD_HEAL_PER_HIT,
   BLOOD_MULT,
   BLOOD_RANGE,
+  CANCEL_TABLE,
   CHARGE_L1_ARC_DEG,
   CHARGE_L1_KNOCKBACK,
   CHARGE_L1_MS,
@@ -36,6 +37,7 @@ import {
   HITSTOP_COMP_MAX_MS,
   HITSTOP_HIT_MS,
   HITSTOP_KILL_MS,
+  INPUT_BUFFER_MS,
   KNOCKBACK_SPEED,
   LEVEL_CLEAR_HEAL_RATIO,
   PLAYER_INVULN_MS,
@@ -57,7 +59,9 @@ import {
   TOTAL_LEVELS,
   WALL_THICKNESS,
   enemyStatScale,
+  lockedEdge,
   spawnPlanForLevel,
+  type ActionId,
   type EnemyKindId,
   type SkillDef,
 } from '@/game/config';
@@ -451,6 +455,17 @@ export class DungeonScene extends Phaser.Scene {
   /** 收招后摇截止时间：后摇期间不能出手，是"三级越猛越有代价"的一部分。 */
   private recoveryUntil = 0;
 
+  // ---- 连段内核：当前动作 + 输入缓冲 ----
+  /** 当前动作（取消表的查询键）。空闲态是 'swing'：自动普攻不做承诺。 */
+  private currentAction: ActionId = 'swing';
+  /** 当前动作的起始时刻，取消窗口从这里算起。 */
+  private actionStartedAt = 0;
+  /** 当前动作自己的结束时刻。走完就回到空闲态，于是"什么都能接"。 */
+  private actionUntil = 0;
+  /** 缓冲住的输入：窗口没开 / 还在冷却时按键先记在这里，由 flushPendingAction 放出去。 */
+  private pendingAction: ActionId | null = null;
+  private pendingAt = 0;
+
   // ---- 跳劈：前跃 + 落点 AoE ----
   private leapUntil = 0;
   private leapVx = 0;
@@ -549,9 +564,8 @@ export class DungeonScene extends Phaser.Scene {
       }
       return;
     }
-    // 顿帧冻结的是逻辑层，但 dashUntil / leapUntil / thrustUntil 走的是绝对时间。
-    // 不把冻住的这段补回去，就会"命中越准、突进越短"：突刺打中目标反而少走约 100 单位，
-    // 够不到原本够得到的第二只怪。
+    // 顿帧冻结的是逻辑层，但下面这些时间戳全部走绝对时间。不把冻住的这段补回去，
+    // 就会"命中越准、突进越短"：突刺打中目标反而少走约 100 单位，够不到原本够得到的第二只怪。
     if (this.hitStopFrozenAt >= 0) {
       const frozen = Phaser.Math.Clamp(
         this.time.now - this.hitStopFrozenAt,
@@ -559,12 +573,11 @@ export class DungeonScene extends Phaser.Scene {
         HITSTOP_COMP_MAX_MS,
       );
       this.hitStopFrozenAt = -1;
-      this.dashUntil += frozen;
-      this.leapUntil += frozen;
-      this.thrustUntil += frozen;
-      this.swingUntil += frozen;
+      this.shiftActionTimers(frozen);
     }
     const d = Math.min(delta, 50);
+    // 缓冲输入先放：它可能立刻开一个位移招，必须赶在本帧的位移结算之前。
+    this.flushPendingAction();
     // 跳劈落地结算必须在位移之前：否则落地那一帧会先被输入带走。
     this.updateLeapSlam();
     this.updateMovement(d);
@@ -609,6 +622,117 @@ export class DungeonScene extends Phaser.Scene {
     this.hitStopUntil = 0;
     this.hitStopFrozenAt = -1;
     this.lastLogicAt = 0;
+    this.currentAction = 'swing';
+    this.actionStartedAt = 0;
+    this.actionUntil = 0;
+    this.pendingAction = null;
+    this.pendingAt = 0;
+  }
+
+  // ========== 连段内核：取消窗口 + 输入缓冲 ==========
+
+  /**
+   * 顿帧解冻后，把所有"绝对时间戳"一起往前推 frozen。
+   *
+   * 之前只补了位移四个（dash / leap / thrust / swing），漏掉 recoveryUntil 和四个冷却：
+   * 每命中一次就悄悄吃掉一点后摇和冷却，一层几十次命中累计上百毫秒，
+   * 表现成"连段窗口忽长忽短"。逐行列举就是漏项的来源，所以这里改成一处统一推。
+   */
+  private shiftActionTimers(frozen: number): void {
+    this.invulnUntil += frozen;
+    this.recoveryUntil += frozen;
+    this.actionUntil += frozen;
+    this.actionStartedAt += frozen;
+    this.pendingAt += frozen;
+    this.chargeStartAt += frozen;
+    this.nextDashGhostAt += frozen;
+    this.dashUntil += frozen;
+    this.leapUntil += frozen;
+    this.thrustUntil += frozen;
+    this.swingUntil += frozen;
+    this.dashReadyAt += frozen;
+    this.bloodReadyAt += frozen;
+    this.thrustReadyAt += frozen;
+    this.chargeReadyAt += frozen;
+  }
+
+  /** 记下当前动作与它的起止：取消窗口的唯一时间基准。 */
+  private beginAction(id: ActionId, until: number): void {
+    this.currentAction = id;
+    this.actionStartedAt = this.time.now;
+    this.actionUntil = until;
+  }
+
+  /**
+   * 现在能不能出 to 这一招？
+   * - 空闲（动作已经走完）→ 能；
+   * - 蓄力按住中 → 一直算"忙"（它的 actionUntil 不推进），只能被表里允许的招打断；
+   * - 动作进行中 → 必须"够早了"（cancelFromMs）且取消表允许（canceledBy）。
+   */
+  private canCancel(to: ActionId): boolean {
+    const now = this.time.now;
+    if (!this.charging && now >= this.actionUntil) {
+      return true;
+    }
+    if (to === this.currentAction) {
+      return false;
+    }
+    const rule = CANCEL_TABLE[this.currentAction];
+    if (now - this.actionStartedAt < rule.cancelFromMs) {
+      return false;
+    }
+    if (!rule.canceledBy.includes(to)) {
+      return false;
+    }
+    // 解锁型边：表里有，但这一局没拿到对应升级卡就不许接。
+    const gate = lockedEdge(this.currentAction, to);
+    return gate === undefined || this.run.unlockedCombos.includes(gate);
+  }
+
+  /**
+   * 脉冲招（冲刺 / 嗜血斩 / 突刺）的统一入口：能出就出，出不了就先缓冲。
+   * 之前 keydown 直接调 tryXxx，冷却没好或后摇未过的按键被静默吞掉——
+   * "按早了没反应"就是这么来的，而且三招各吞一次。
+   */
+  private requestAction(id: ActionId): void {
+    if (this.tryStartAction(id)) {
+      this.pendingAction = null;
+      return;
+    }
+    this.pendingAction = id;
+    this.pendingAt = this.time.now;
+  }
+
+  /** 缓冲槽每帧试放一次；超过 INPUT_BUFFER_MS 还没放出去就丢掉（按太早，不作数）。 */
+  private flushPendingAction(): void {
+    const id = this.pendingAction;
+    if (!id) {
+      return;
+    }
+    if (this.time.now - this.pendingAt > INPUT_BUFFER_MS) {
+      this.pendingAction = null;
+      return;
+    }
+    if (this.tryStartAction(id)) {
+      this.pendingAction = null;
+    }
+  }
+
+  /** 真正出招：取消窗口 + 自身冷却都过了才成立，返回是否出招成功。 */
+  private tryStartAction(id: ActionId): boolean {
+    if (this.phase !== 'playing' || !this.canCancel(id)) {
+      return false;
+    }
+    if (id === 'dash') {
+      return this.startDash();
+    }
+    if (id === 'blood') {
+      return this.startBloodSlash();
+    }
+    if (id === 'thrust') {
+      return this.startThrust();
+    }
+    return false;
   }
 
   private setupKeyboard(): void {
@@ -631,12 +755,13 @@ export class DungeonScene extends Phaser.Scene {
     this.keyJ = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.J);
     this.keyK = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.K);
     this.keyL = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.L);
-    this.keySpace.on('down', () => this.tryDash());
-    this.keyShift.on('down', () => this.tryDash());
+    // 三个脉冲招走 requestAction（带 150ms 缓冲）；蓄力是按住型输入，不走缓冲。
+    this.keySpace.on('down', () => this.requestAction('dash'));
+    this.keyShift.on('down', () => this.requestAction('dash'));
     this.keyJ.on('down', () => this.beginCharge());
     this.keyJ.on('up', () => this.releaseCharge());
-    this.keyK.on('down', () => this.tryBloodSlash());
-    this.keyL.on('down', () => this.tryThrust());
+    this.keyK.on('down', () => this.requestAction('blood'));
+    this.keyL.on('down', () => this.requestAction('thrust'));
     // 浏览器要求音频必须由用户手势解锁：第一次按键 / 触屏时才创建 AudioContext。
     this.input.keyboard.once('keydown', () => sfx.unlock());
     this.input.once('pointerdown', () => sfx.unlock());
@@ -764,7 +889,7 @@ export class DungeonScene extends Phaser.Scene {
     };
 
     this.dashButton = makeButton(xs[0], 0x4c8bf5);
-    this.dashButton.on('pointerdown', () => this.tryDash());
+    this.dashButton.on('pointerdown', () => this.requestAction('dash'));
 
     this.chargeButton = makeButton(xs[1], 0xff8f5c);
     this.chargeButton.on('pointerdown', () => this.beginCharge());
@@ -772,10 +897,10 @@ export class DungeonScene extends Phaser.Scene {
     this.chargeButton.on('pointerout', () => this.releaseCharge());
 
     this.bloodButton = makeButton(xs[2], 0xff5f7a);
-    this.bloodButton.on('pointerdown', () => this.tryBloodSlash());
+    this.bloodButton.on('pointerdown', () => this.requestAction('blood'));
 
     this.thrustButton = makeButton(xs[3], 0xff5f2e);
-    this.thrustButton.on('pointerdown', () => this.tryThrust());
+    this.thrustButton.on('pointerdown', () => this.requestAction('thrust'));
 
     this.abilityGfx = this.add.graphics().setDepth(302).setScrollFactor(0);
 
@@ -930,14 +1055,16 @@ export class DungeonScene extends Phaser.Scene {
     }
   }
 
-  /** 冲刺 / 翻滚：短距离位移 + 冲刺无敌 + 冷却。 */
-  private tryDash(): void {
-    if (this.phase !== 'playing' || this.charging) {
-      return;
-    }
+  /**
+   * 冲刺 / 翻滚：短距离位移 + 冲刺无敌 + 冷却。
+   *
+   * 它同时是连段里的"通用取消"：能打断蓄力（按住时唯一出路）和跳劈，
+   * 也顺手掐掉正在飞的突刺。取消蓄力要付冷却代价，否则就成了没有成本的循环。
+   */
+  private startDash(): boolean {
     const now = this.time.now;
     if (now < this.dashReadyAt) {
-      return;
+      return false;
     }
     const input = this.readMoveInput();
     let dx = input.dx;
@@ -961,12 +1088,27 @@ export class DungeonScene extends Phaser.Scene {
     this.nextDashGhostAt = 0;
     // 每次冲刺重新开一张命中表：一次冲刺里每只怪只吃一记冲撞斩。
     this.dashHitSet = new Set();
+    // 取消蓄力：清掉按压状态，冷却照收（等于"自己松手打空"），不给无成本取消。
+    if (this.charging) {
+      this.charging = false;
+      this.chargeLevel = 0;
+      this.chargeReadyAt = Math.max(this.chargeReadyAt, now + CHARGE_RECOVERY_MS);
+    }
+    // 掐掉飞行中的突刺 / 跳劈：冲刺一旦成立，旧动作就不该再结算。
     this.thrustUntil = 0;
+    this.leapUntil = 0;
+    this.leapSlam = undefined;
+    this.beginAction('dash', this.dashUntil);
     sfx.dash();
     this.cameras.main.shake(90, 0.0016);
+    return true;
   }
 
-  /** 开始蓄力重击。 */
+  /**
+   * 开始蓄力重击。
+   * 按住型输入不走缓冲（"提前 150ms 记住一次按住"没有意义），所以后摇里按蓄力
+   * 直接忽略而不是排队——这一档由取消表决定，与脉冲招的缓冲是两条路。
+   */
   private beginCharge(): void {
     if (this.phase !== 'playing' || this.charging) {
       return;
@@ -974,14 +1116,20 @@ export class DungeonScene extends Phaser.Scene {
     if (this.time.now < this.chargeReadyAt) {
       return;
     }
+    if (!this.canCancel('chargeHold')) {
+      return;
+    }
     this.charging = true;
     this.chargeStartAt = this.time.now;
+    this.beginAction('chargeHold', 0);
   }
 
   /**
    * 松开蓄力：按住时长决定落在三级中的哪一档。
    * Lv1 快斩（快而轻）/ Lv2 横扫（大扇形 + 强击退）/ Lv3 跳劈（前跃 + 落点 AoE）。
    * 三级共用同一个后摇，所以"蓄得越久"的收益是伤害与范围，代价是蓄力期间移速腰斩。
+   * 取消窗口从"松手这一帧"重算，所以三级窗口长度一致，区别只在 CANCEL_TABLE 放谁进来：
+   * Lv1 能接突刺（"蓄力接突刺"），Lv2 / Lv3 只能接冲刺（蓄得越猛承诺越硬）。
    */
   private releaseCharge(): void {
     if (!this.charging) {
@@ -1005,7 +1153,8 @@ export class DungeonScene extends Phaser.Scene {
     this.recoveryUntil = now + CHARGE_RECOVERY_MS;
 
     if (held < CHARGE_L2_MS) {
-      // Lv1 快斩：短、快、低倍率。
+      // Lv1 快斩：短、快、低倍率。canceledBy 带 thrust → "蓄力接突刺"。
+      this.beginAction('charge1', this.recoveryUntil);
       this.doMeleeSwing(angle, {
         range: CHARGE_L1_RANGE,
         arcDeg: CHARGE_L1_ARC_DEG,
@@ -1019,6 +1168,7 @@ export class DungeonScene extends Phaser.Scene {
 
     if (held < CHARGE_L3_MS) {
       // Lv2 横扫：200° 大扇形 + 强击退，专门把贴脸的怪扫开。
+      this.beginAction('charge2', this.recoveryUntil);
       this.doMeleeSwing(angle, {
         range: CHARGE_L2_RANGE,
         arcDeg: CHARGE_L2_ARC_DEG,
@@ -1031,6 +1181,8 @@ export class DungeonScene extends Phaser.Scene {
     }
 
     // Lv3 跳劈：先跃起，落地那一帧交给 updateLeapSlam() 结算落点 AoE。
+    // 结束时间先按"后摇"铺，落地那一刻会被 updateLeapSlam 再往后扽一次。
+    this.beginAction('charge3', this.recoveryUntil);
     const leapSpeed = CHARGE_LEAP_DISTANCE / (CHARGE_LEAP_MS / 1000);
     this.leapVx = Math.cos(angle) * leapSpeed;
     this.leapVy = Math.sin(angle) * leapSpeed;
@@ -1822,16 +1974,15 @@ export class DungeonScene extends Phaser.Scene {
     this.cameras.main.shake(220, SHAKE_KILL * 1.7);
     this.chargeReadyAt = now + CHARGE_RECOVERY_MS;
     this.recoveryUntil = now + CHARGE_RECOVERY_MS;
+    // 落地这一下把"跳劈"的承诺再往后扽：起跳时铺的结束时间已经不作数了。
+    this.actionUntil = this.recoveryUntil;
   }
 
   /** K · 嗜血斩：扇形伤害并把命中数换成回血（单次有上限）。 */
-  private tryBloodSlash(): void {
-    if (this.phase !== 'playing' || this.charging) {
-      return;
-    }
+  private startBloodSlash(): boolean {
     const now = this.time.now;
-    if (now < this.bloodReadyAt || now < this.recoveryUntil) {
-      return;
+    if (now < this.bloodReadyAt) {
+      return false;
     }
     this.bloodReadyAt = now + BLOOD_CD_MS;
     sfx.blood();
@@ -1843,12 +1994,15 @@ export class DungeonScene extends Phaser.Scene {
       heavy: true,
       color: 0xff5f7a,
     });
+    // 承诺长度跟随刀光：doMeleeSwing 已经把 swingUntil 推到 now + 170。
+    this.beginAction('blood', this.swingUntil);
     if (hits > 0) {
       const heal = Math.min(BLOOD_HEAL_MAX, hits * BLOOD_HEAL_PER_HIT);
       this.run.hp = Math.min(this.run.maxHp, this.run.hp + heal);
       sfx.heal();
       this.spawnHealText(heal);
     }
+    return true;
   }
 
   /** 嗜血斩回血飘字：绿色 + 向上飘，和伤害飘字区分开。 */
@@ -1884,16 +2038,10 @@ export class DungeonScene extends Phaser.Scene {
    * L · 突刺：朝锁定目标长距突进，路径上最多命中 2 个敌人（穿透 1），
    * 单体高倍率，专门用来点掉精英 / Boss。突进期间短暂无敌。
    */
-  private tryThrust(): void {
-    if (this.phase !== 'playing' || this.charging) {
-      return;
-    }
+  private startThrust(): boolean {
     const now = this.time.now;
-    if (now < this.thrustReadyAt || now < this.recoveryUntil) {
-      return;
-    }
-    if (now < this.dashUntil || now < this.leapUntil) {
-      return;
+    if (now < this.thrustReadyAt) {
+      return false;
     }
     this.thrustReadyAt = now + THRUST_CD_MS;
     const angle = this.aimAngle();
@@ -1917,6 +2065,8 @@ export class DungeonScene extends Phaser.Scene {
     this.swingUntil = now + THRUST_MS;
     this.spawnSlashArc(angle, 40, THRUST_DISTANCE, 0xff5f2e, true);
     this.cameras.main.shake(120, SHAKE_KILL);
+    this.beginAction('thrust', this.thrustUntil);
+    return true;
   }
 
   /** 突刺命中：沿路径结算高倍率单体伤害，最多打 2 个。 */

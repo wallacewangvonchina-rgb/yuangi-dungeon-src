@@ -1,9 +1,11 @@
 import {
   BASE_PLAYER,
   SKILL_POOL,
+  type ComboId,
   type SkillDef,
   type SkillId,
 } from './config';
+import { rand } from './rng';
 
 // ========== 单局状态（RunState） ==========
 export interface RunState {
@@ -21,6 +23,8 @@ export interface RunState {
   /** 本局击杀数：结算面板上给"这局打得怎么样"一个具体数字。 */
   kills: number;
   skills: SkillId[];
+  /** 本局已解锁的连段边（由升级卡写入）；canCancel 查这里决定窗口开不开。 */
+  unlockedCombos: ComboId[];
 }
 
 // ========== 局外成长状态（MetaState，localStorage 持久化） ==========
@@ -99,6 +103,7 @@ export const createRunState = (meta: MetaState): RunState => ({
   level: 1,
   kills: 0,
   skills: [],
+  unlockedCombos: [],
 });
 
 export const applySkill = (state: RunState, skill: SkillDef): void => {
@@ -129,6 +134,11 @@ export const applySkill = (state: RunState, skill: SkillDef): void => {
       state.luck += 0.25;
       break;
   }
+  // 解锁型卡：把这条取消边记进本局状态，canCancel 会查它。
+  const unlocked = skill.unlock;
+  if (unlocked !== undefined) {
+    state.unlockedCombos.push(unlocked);
+  }
   state.skills.push(skill.id);
 };
 
@@ -138,8 +148,25 @@ export const pickSkillOptions = (
   count = 3,
 ): SkillDef[] => {
   const available = SKILL_POOL.filter((s) => !run.skills.includes(s.id));
-  const shuffled = [...available].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count);
+  // Fisher-Yates + 种子化随机源：抽卡必须可复现，否则 P4 拿机器人跑 12 次的基线
+  // 是噪声（同一份代码两次跑出不同卡序，「这层变难了」就无从判断）。
+  // 顺带修掉旧写法 sort(() => Math.random() - 0.5) 的分布偏斜：
+  // 比较器不满足传递性，洗出来的顺序不是均匀分布。
+  const shuffled = [...available];
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rand() * (i + 1));
+    const tmp = shuffled[i];
+    shuffled[i] = shuffled[j];
+    shuffled[j] = tmp;
+  }
+  const picks = shuffled.slice(0, count);
+  // 保底：卡池里还有解锁型卡、这次一张都没抽到，就拿它顶掉末位。
+  // 连段是这层的核心产出，纯随机会让玩家整局拿不到新招。
+  const fallback = shuffled.find((s) => s.unlock);
+  if (fallback && picks.length > 0 && !picks.some((s) => s.unlock)) {
+    picks[picks.length - 1] = fallback;
+  }
+  return picks;
 };
 
 // ========== 结算与局外成长 ==========

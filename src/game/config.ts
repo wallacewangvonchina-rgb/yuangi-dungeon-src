@@ -123,6 +123,115 @@ export const THRUST_MULT = 3;
 export const THRUST_REACH = gameUnits(80);
 export const THRUST_INVULN_MS = 220;
 
+// ========== 连段内核：取消窗口 + 输入缓冲 ==========
+/**
+ * 招式标识。取消表按"动作"记而不是按"按键"记：同一次按键在蓄力档位不同时
+ * 会落到不同动作上（charge1/2/3），能接上的后续招也不同。
+ */
+export type ActionId =
+  | 'swing'
+  | 'chargeHold'
+  | 'charge1'
+  | 'charge2'
+  | 'charge3'
+  | 'dash'
+  | 'blood'
+  | 'thrust';
+
+export interface CancelRule {
+  /** 从本动作起算，多久之后才允许被取消（ms）。窗口越早开，"承诺"越轻。 */
+  cancelFromMs: number;
+  /** 可以被哪些动作取消。不在这张表里的招，只能等本动作自己走完。 */
+  canceledBy: ActionId[];
+}
+
+/**
+ * 取消表 = 连段的唯一真源。
+ *
+ * 在这之前"谁能接谁"是散在状态机里的副作用（比如冲刺顺手把 thrustUntil 清 0），
+ * 所以"挥剑接冲刺"能做出来纯属巧合，而"蓄力接突刺"是被自己的后摇挡死的。
+ * 表化之后，第三第四条派生只改这张表，不动状态机。
+ *
+ * 设计意图：
+ * - swing 是空闲态（自动普攻不做承诺），cancelFromMs 0：任何招都能立刻接；
+ * - dash 进每一行：冲刺是通用逃生，任何动作都得能在"够早之后"被打断；
+ * - chargeHold 只允许 dash 打断：蓄力按住的唯一出路是跑；
+ * - charge2 / charge3 也只允许 dash：蓄得越猛承诺越硬，这是"越猛越有代价"的落点；
+ * - charge1 额外允许 thrust：这就是"蓄力接突刺"那条基础连段。
+ *   注：charge2 → thrust / charge3 → blood / dash → thrust 三条边确实写在表里，
+ *   但默认锁死，靠升级卡解锁（见 COMBO_DEFS 与 lockedEdge）。
+ */
+export const CANCEL_TABLE: Record<ActionId, CancelRule> = {
+  swing: { cancelFromMs: 0, canceledBy: ['chargeHold', 'dash', 'blood', 'thrust'] },
+  chargeHold: { cancelFromMs: 140, canceledBy: ['dash'] },
+  charge1: { cancelFromMs: 140, canceledBy: ['dash', 'thrust'] },
+  charge2: { cancelFromMs: 220, canceledBy: ['dash', 'thrust'] },
+  charge3: { cancelFromMs: 300, canceledBy: ['dash', 'blood'] },
+  dash: { cancelFromMs: 120, canceledBy: ['chargeHold', 'blood', 'thrust'] },
+  blood: { cancelFromMs: 200, canceledBy: ['dash', 'thrust'] },
+  thrust: { cancelFromMs: 100, canceledBy: ['dash'] },
+};
+
+/**
+ * 解锁型派生：这些取消边**写在表里**（表仍是唯一真源），但默认锁死，
+ * 要靠升级卡解锁后才生效。
+ *
+ * 为什么不把锁住的边从表里删掉：表要能一眼看全「这游戏里存在哪些连段」，
+ * 锁的只是「这一局你有没有拿到」；否则每加一张卡都要同时改表和改判定。
+ */
+export type ComboId = 'dashThrust' | 'charge2Thrust' | 'charge3Blood';
+
+export interface ComboDef {
+  id: ComboId;
+  from: ActionId;
+  to: ActionId;
+  name: string;
+  icon: string;
+  desc: string;
+  color: number;
+}
+
+export const COMBO_DEFS: ComboDef[] = [
+  {
+    id: 'dashThrust',
+    from: 'dash',
+    to: 'thrust',
+    name: '冲刺突刺',
+    icon: '💠',
+    desc: '解锁连段：冲刺途中可直接接出突刺',
+    color: 0x6fb3ff,
+  },
+  {
+    id: 'charge2Thrust',
+    from: 'charge2',
+    to: 'thrust',
+    name: '二段突刺',
+    icon: '🌀',
+    desc: '解锁连段：二级蓄力斩后摇中可接突刺',
+    color: 0x9b8cff,
+  },
+  {
+    id: 'charge3Blood',
+    from: 'charge3',
+    to: 'blood',
+    name: '满蓄嗜血',
+    icon: '🩸',
+    desc: '解锁连段：满级蓄力斩后摇中可接嗜血斩',
+    color: 0xd4566e,
+  },
+];
+
+/** (from → to) 这条边是不是解锁型的？是就返回它需要的 ComboId。 */
+export const lockedEdge = (from: ActionId, to: ActionId): ComboId | undefined =>
+  COMBO_DEFS.find((c) => c.from === from && c.to === to)?.id;
+
+/**
+ * 输入缓冲：窗口还没开、或招式还在冷却时按下的键，最多先记这么久。
+ * 窗口一开就自动放出去，所以"按早了"不丢招，只是晚一点生效——
+ * 这是"丝滑"的一半来源（另一半是取消窗口本身）。
+ */
+export const INPUT_BUFFER_MS = 150;
+
 // ========== 敌人种类 ==========
 export type EnemyKindId = 'slime' | 'bat' | 'skeleton' | 'boss';
 
@@ -234,7 +343,9 @@ export type SkillId =
   | 'multi'
   | 'vampire'
   | 'pierce'
-  | 'luck';
+  | 'luck'
+  /** 解锁型卡：id 由 ComboId 派生，和 COMBO_DEFS 一一对应，不会两处对不上。 */
+  | `combo-${ComboId}`;
 
 export interface SkillDef {
   id: SkillId;
@@ -242,6 +353,12 @@ export interface SkillDef {
   icon: string;
   desc: string;
   color: number;
+  /**
+   * 解锁型卡的载荷：拿到哪张卡就解锁哪条取消边。
+   * 数值卡不填这个字段——所以「是不是解锁卡」只有这一个判据，
+   * 不需要额外的 kind 枚举（两个判据就会有不一致的那天）。
+   */
+  unlock?: ComboId;
 }
 
 export const SKILL_POOL: SkillDef[] = [
@@ -301,4 +418,13 @@ export const SKILL_POOL: SkillDef[] = [
     desc: '金币收益 +25%',
     color: 0x7fd46e,
   },
+  // 解锁型卡：不加数值，给的是「一条新连段」。名字/图标/配色从 COMBO_DEFS 派生，改连段只改一处。
+  ...COMBO_DEFS.map((c) => ({
+    id: `combo-${c.id}` as SkillId,
+    name: c.name,
+    icon: c.icon,
+    desc: c.desc,
+    color: c.color,
+    unlock: c.id,
+  })),
 ];
