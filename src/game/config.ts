@@ -136,7 +136,8 @@ export type ActionId =
   | 'charge3'
   | 'dash'
   | 'blood'
-  | 'thrust';
+  | 'thrust'
+  | 'counter';
 
 export interface CancelRule {
   /** 从本动作起算，多久之后才允许被取消（ms）。窗口越早开，"承诺"越轻。 */
@@ -170,6 +171,12 @@ export const CANCEL_TABLE: Record<ActionId, CancelRule> = {
   dash: { cancelFromMs: 120, canceledBy: ['chargeHold', 'blood', 'thrust'] },
   blood: { cancelFromMs: 200, canceledBy: ['dash', 'thrust'] },
   thrust: { cancelFromMs: 100, canceledBy: ['dash'] },
+  /**
+   * 反击斩：出招快、后摇短，是「奖励接上」的招；只留 dash 当逃生出口。
+   * 它不走按键输入（触发源是敌人收招），所以没有任何招「取消进」它——
+   * 表里唯一一条只能被敌人触发的动作，但它的后摇仍遵守同一套规则。
+   */
+  counter: { cancelFromMs: 120, canceledBy: ['dash'] },
 };
 
 /**
@@ -180,6 +187,13 @@ export const CANCEL_TABLE: Record<ActionId, CancelRule> = {
  * 锁的只是「这一局你有没有拿到」；否则每加一张卡都要同时改表和改判定。
  */
 export type ComboId = 'dashThrust' | 'charge2Thrust' | 'charge3Blood';
+
+/**
+ * 升级卡能解锁的「新招」总集：连段边（ComboId）+ 反击斩（parryCounter）。
+ * 反击斩不是 (from → to) 的边，所以不进 COMBO_DEFS，但它和连段一样是
+ * 「拿到卡才会出现的招」，于是共用同一个解锁通道——applySkill 只认这一个字段。
+ */
+export type UnlockId = ComboId | 'parryCounter';
 
 export interface ComboDef {
   id: ComboId;
@@ -232,6 +246,77 @@ export const lockedEdge = (from: ActionId, to: ActionId): ComboId | undefined =>
  */
 export const INPUT_BUFFER_MS = 150;
 
+// ========== 反击斩（解锁型招式） ==========
+/**
+ * 触发不靠按键：冲刺 / 突刺的无敌帧就是反击窗——那些无敌帧本来只是为了「穿过攻击」，
+ * 现在把「擦过敌人的收招」从躲开变成一次机会，等于给已有的位移招加了一层回报。
+ * 只对敌人收招那一下（真会掉血的那次接触）成立，起手红闪不触发：
+ * 否则站着挨打也能反击，反击就退化成无脑连按。
+ */
+export const COUNTER_CD_MS = 3000;
+export const COUNTER_MS = 240;
+export const COUNTER_RANGE = gameUnits(215);
+export const COUNTER_ARC_DEG = 170;
+export const COUNTER_MULT = 2.4;
+export const COUNTER_KNOCKBACK = 520;
+
+// ========== 敌人霸体分档 ==========
+/**
+ * 命中敌人时「起手红闪断不断」的分档。没有它时只有一个隐含规则（任何命中都打断），
+ * 于是所有怪都是同一块靶子：越快的怪越该怕被打断，越硬的怪越该逼玩家走位。
+ * - none：任何命中都真打断（蝙蝠：最快也最脆，被打断就是「快」的代价）；
+ * - windup：不打断，但把起手往后推 POISE_WINDUP_PUSH_MS，最多推 POISE_WINDUP_RESETS 次；
+ * - full：只能被带 poiseBreak 的招打断（Boss ← 反击斩）。
+ */
+export type EnemyPoise = 'none' | 'windup' | 'full';
+
+/**
+ * 起手最多被推几次 / 每次推多久。
+ * 上限是必须的：高频普攻若能把起手无限往后推，敌人就永远打不出这一下，
+ * 等于被永久免伤锁死——那是「看起来在打断、其实在无敌」的假机制。
+ */
+export const POISE_WINDUP_RESETS = 2;
+export const POISE_WINDUP_PUSH_MS = 260;
+
+// ========== Boss 招式层（阶段） ==========
+/**
+ * Boss 按剩余血量分档，换档就「换一个人」：更快、收招更密。
+ * 顺序必须从重到轻——bossPhaseFor 用 find 取第一个 hpRatio <= hpRatioMax 的项，
+ * 把 1 写在前面会让残血 Boss 永远停在最慢的那一档。
+ */
+export interface BossPhase {
+  /** 这一档覆盖的血量上限（占比）。 */
+  hpRatioMax: number;
+  /** 设计基准速度。 */
+  speed: number;
+  /** 收招间隔。 */
+  attackCooldownMs: number;
+  /** 震地：判定半径远大于贴身圈，站着不动必吃，逼出位移。 */
+  slam: boolean;
+  /** 红闪二连：一次起手打两下，第二下单独再红闪一次。 */
+  doubleHit: boolean;
+}
+
+export const BOSS_PHASES: BossPhase[] = [
+  // 狂暴：残血后提速 + 收招变密 + 二连，把「再撑一下」变成真的撑不住
+  { hpRatioMax: 0.5, speed: 140, attackCooldownMs: 750, slam: true, doubleHit: true },
+  { hpRatioMax: 1, speed: 100, attackCooldownMs: 1100, slam: true, doubleHit: false },
+];
+
+export const bossPhaseFor = (hpRatio: number): BossPhase =>
+  BOSS_PHASES.find((p) => hpRatio <= p.hpRatioMax) ??
+  BOSS_PHASES[BOSS_PHASES.length - 1];
+
+/**
+ * 震地判定半径（以敌人圆心起算）= 贴身圈 + 敌人半径 × 这个系数。
+ * 必须明显大于贴身圈，否则玩家「站在贴身处」就等于安全，逼不出位移。
+ * 判定与警示环共用这一个表达式，所以「站在圈里 = 一定会吃」是能看出来的。
+ */
+export const SLAM_RADIUS_MULT = 2.2;
+export const SLAM_DAMAGE_MULT = 1.35;
+/** 红闪二连：第二下的前摇（够短，读得到；站着不动躲不掉）。 */
+export const BOSS_DOUBLE_HIT_MS = 220;
+
 // ========== 敌人种类 ==========
 export type EnemyKindId = 'slime' | 'bat' | 'skeleton' | 'boss';
 
@@ -245,6 +330,8 @@ export interface EnemyKindConfig {
   radius: number;
   coins: number;
   attackCooldownMs: number;
+  /** 霸体档位，见 EnemyPoise / POISE_*。 */
+  poise: EnemyPoise;
 }
 
 export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
@@ -259,6 +346,8 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     radius: gameUnits(48),
     coins: 5,
     attackCooldownMs: 900,
+    // 能推不能断：普攻救不了场，但能换来一点时间（上限见 POISE_WINDUP_RESETS）。
+    poise: 'windup',
   },
   bat: {
     id: 'bat',
@@ -270,6 +359,8 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     radius: gameUnits(34),
     coins: 4,
     attackCooldownMs: 700,
+    // 最快也最脆：任何命中都打断它，这是「快」的代价。
+    poise: 'none',
   },
   skeleton: {
     id: 'skeleton',
@@ -285,6 +376,8 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     radius: gameUnits(50),
     coins: 9,
     attackCooldownMs: 1000,
+    // 和史莱姆同档：慢速高耐久，起手只是被推、不会被普攻掐断。
+    poise: 'windup',
   },
   boss: {
     id: 'boss',
@@ -300,6 +393,9 @@ export const ENEMY_KINDS: Record<EnemyKindId, EnemyKindConfig> = {
     radius: gameUnits(120),
     coins: 80,
     attackCooldownMs: 1100,
+    // 只有反击斩能打断它的起手——这就是「反击斩必须是卡」的理由。
+    // 注意 speed / attackCooldownMs 只是基准值：实战按 BOSS_PHASES 分档取。
+    poise: 'full',
   },
 };
 
@@ -344,8 +440,8 @@ export type SkillId =
   | 'vampire'
   | 'pierce'
   | 'luck'
-  /** 解锁型卡：id 由 ComboId 派生，和 COMBO_DEFS 一一对应，不会两处对不上。 */
-  | `combo-${ComboId}`;
+  /** 解锁型卡：id 由 UnlockId 派生，和 COMBO_DEFS / 反击斩一一对应，不会两处对不上。 */
+  | `combo-${UnlockId}`;
 
 export interface SkillDef {
   id: SkillId;
@@ -358,7 +454,7 @@ export interface SkillDef {
    * 数值卡不填这个字段——所以「是不是解锁卡」只有这一个判据，
    * 不需要额外的 kind 枚举（两个判据就会有不一致的那天）。
    */
-  unlock?: ComboId;
+  unlock?: UnlockId;
 }
 
 export const SKILL_POOL: SkillDef[] = [
@@ -417,6 +513,16 @@ export const SKILL_POOL: SkillDef[] = [
     icon: '🍀',
     desc: '金币收益 +25%',
     color: 0x7fd46e,
+  },
+  // 反击斩：唯一能打断 Boss 霸体的招，所以它必须是「要拿的卡」而不是天生就有。
+  // 触发不新增按键——冲刺 / 突刺的无敌帧本身就是反击窗，玩家已经在用了。
+  {
+    id: 'combo-parryCounter',
+    name: '反击斩',
+    icon: '⚔️',
+    desc: '解锁招式：无敌帧内被收招命中时改判反击，可打断霸体（含 Boss）',
+    color: 0xffd166,
+    unlock: 'parryCounter',
   },
   // 解锁型卡：不加数值，给的是「一条新连段」。名字/图标/配色从 COMBO_DEFS 派生，改连段只改一处。
   ...COMBO_DEFS.map((c) => ({

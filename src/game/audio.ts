@@ -225,6 +225,17 @@ export const sfx = {
     tone({ freq: 220, to: 90, dur: 0.16, type: 'sawtooth', gain: 0.12 });
   },
 
+  /**
+   * 反击斩：一记清脆的金属「叮」+ 反向破空。
+   * 和普通命中刻意拉开音色——它是奖励音，玩家要从声音上就知道「这一下接对了」。
+   */
+  counter(): void {
+    if (!ensure()) return;
+    burst({ dur: 0.16, gain: 0.3, from: 5200, to: 1400, q: 1.3 });
+    tone({ freq: 1320, to: 1980, dur: 0.1, type: 'square', gain: 0.14 });
+    tone({ freq: 880, dur: 0.22, type: 'triangle', gain: 0.12, delay: 0.03 });
+  },
+
   /** 回血：两个上行音，柔和一点，别和伤害音混。 */
   heal(): void {
     if (!ensure()) return;

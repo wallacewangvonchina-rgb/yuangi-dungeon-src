@@ -1,9 +1,9 @@
 import {
   BASE_PLAYER,
   SKILL_POOL,
-  type ComboId,
   type SkillDef,
   type SkillId,
+  type UnlockId,
 } from './config';
 import { rand } from './rng';
 
@@ -23,8 +23,8 @@ export interface RunState {
   /** 本局击杀数：结算面板上给"这局打得怎么样"一个具体数字。 */
   kills: number;
   skills: SkillId[];
-  /** 本局已解锁的连段边（由升级卡写入）；canCancel 查这里决定窗口开不开。 */
-  unlockedCombos: ComboId[];
+  /** 本局已解锁的新招（连段边 + 反击斩，由升级卡写入）；canCancel / 反击都查这里。 */
+  unlockedCombos: UnlockId[];
 }
 
 // ========== 局外成长状态（MetaState，localStorage 持久化） ==========
@@ -134,7 +134,7 @@ export const applySkill = (state: RunState, skill: SkillDef): void => {
       state.luck += 0.25;
       break;
   }
-  // 解锁型卡：把这条取消边记进本局状态，canCancel 会查它。
+  // 解锁型卡：把解锁的这条「新招」记进本局状态，canCancel / 反击会查它。
   const unlocked = skill.unlock;
   if (unlocked !== undefined) {
     state.unlockedCombos.push(unlocked);

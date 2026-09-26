@@ -29,6 +29,7 @@ const TABLE = {
   dash:       { from: 120, by: ["chargeHold", "blood", "thrust"] },
   blood:      { from: 200, by: ["dash", "thrust"] },
   thrust:     { from: 100, by: ["dash"] },
+  counter:    { from: 120, by: ["dash"] },
 };
 // 能被玩家"按出来"的三个脉冲招（charge 是按住型输入，不走缓冲）
 const PULSE = ["dash", "blood", "thrust"];
@@ -113,17 +114,22 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
 
   // 三、端到端正例：蓄力(L1) 后摇中按 L，突刺必须真的出去
   console.log("=== 端到端：蓄力(L1) 后摇中按 L ===");
-  const setup = (action, elapsed) => page.evaluate(({ action, elapsed }) => {
+  // windowMs 必须长到整段测试都盖得住：headless 一帧能到 250ms，400ms 的窗口会在
+  // 按键被处理到之前就过期，动作走完变空闲态 → 什么招都放行，负例就会因为
+  // 「已经不是窗口了」而假红。窗口给足，测的才是「窗口开着、但这条边被拒」。
+  // pendingAction 一并清掉：上一节的输入缓冲不许漏进这一节。
+  const setup = (action, elapsed, windowMs = 5000) => page.evaluate(({ action, elapsed, windowMs }) => {
     const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
     sc.thrustReadyAt = 0;
-    sc.recoveryUntil = sc.time.now + 400;
+    sc.pendingAction = null;
+    sc.recoveryUntil = sc.time.now + windowMs;
     sc.currentAction = action;
     sc.actionStartedAt = sc.time.now - elapsed;
     sc.actionUntil = sc.recoveryUntil;
     sc.charging = false;
     window.__THRUSTS__ = 0;
     return sc.currentAction;
-  }, { action, elapsed });
+  }, { action, elapsed, windowMs });
 
   await setup("charge1", 200);
   await page.keyboard.press("l");
@@ -231,6 +237,9 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
     dashThrust: ["dash", "thrust"],
     charge2Thrust: ["charge2", "thrust"],
     charge3Blood: ["charge3", "blood"],
+    // 反击斩不是 (from → to) 的取消边：它的触发源是敌人的收招，玩家只是挨打，
+    // 所以判定走 tryStartCounter（解锁没 + 冷却好没），不查取消表。
+    parryCounter: null,
   };
   const picked = await page.evaluate((edgeOf) => {
     const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
@@ -245,7 +254,16 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
     sc.createSkillCard = orig;
     if (!unlockSkill) { return { id: null }; }
     const pair = edgeOf[unlockSkill.unlock];
+    // 先清空解锁状态：保证「选卡前被拒」测的是锁，而不是上一节留下的残留。
+    sc.run.unlockedCombos = [];
     const probe = () => {
+      if (!pair) {
+        // 反击斩：选卡前 phase 是 levelup、选卡后是 playing，两边都钉成 playing，
+        // 否则这条断言会退化成「被 phase 挡住」——那就测不到锁了。
+        sc.phase = "playing";
+        sc.counterReadyAt = 0;
+        return sc.tryStartCounter();
+      }
       sc.charging = false;
       sc.currentAction = pair[0];
       sc.actionStartedAt = sc.time.now - 5000;
@@ -267,7 +285,140 @@ const check = (cond, msg) => { if (!cond) { fails.push(msg); console.log("  FAIL
   check(picked.blockedBefore === false, "选卡前该连段被拒（" + picked.gate + "）");
   check(picked.unlocked && picked.unlocked.indexOf(picked.gate) >= 0,
     "选卡后 run.unlockedCombos 里出现 " + picked.gate);
-  check(picked.allowedAfter === true, "选卡后该连段当场可接（applySkill → canCancel 全链路通）");
+  check(picked.allowedAfter === true, "选卡后该招当场可接（applySkill → 判定 全链路通）");
+
+  // 九、霸体分档：三档的语义差异必须真的成立，而不是只有一张表。
+  // 表只能证明"配了"，这里证明"命中时真的按它分支了"。
+  console.log("=== 霸体分档（none / windup / full）===");
+  const POISE_PUSH = 260; // 抄自 config.ts 的 POISE_WINDUP_PUSH_MS
+  const poise = await page.evaluate((push) => {
+    const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
+    // 直接按层生成：L3 拿 Boss、L2 拿蝙蝠。走的是真实 spawnEnemies 链路，
+    // 所以它同时验证了"ENEMY_KINDS 里的档位真的被抄进敌人实例"。
+    const n0 = sc.enemies.length;
+    sc.spawnEnemies(3);
+    const l3 = sc.enemies.slice(n0);
+    sc.spawnEnemies(2);
+    const l2 = sc.enemies.slice(n0 + l3.length);
+    const boss = l3.filter((e) => e.isBoss)[0];
+    const bat = l2.filter((e) => e.kind === "bat")[0];
+    const slime = l2.filter((e) => e.kind === "slime")[0];
+
+    const arm = (e) => {
+      e.hp = 99999; e.maxHp = 99999;
+      e.telegraphing = true;
+      e.windupEnd = sc.time.now + 1000;
+      e.poiseResets = 0;
+      return e.windupEnd;
+    };
+    const snap = (e, base, poiseBreak) => {
+      sc.damageEnemy(e, 1, 0, false, 0, { poiseBreak });
+      return {
+        telegraphing: e.telegraphing,
+        pushed: Math.round(e.windupEnd - base),
+        windupCleared: e.windupEnd === 0,
+        cooling: e.nextAttackAt > sc.time.now,
+        resets: e.poiseResets,
+      };
+    };
+    const out = { kinds: { boss: boss.poise, bat: bat.poise, slime: slime.poise } };
+    out.bat = snap(bat, arm(bat), false);
+    const t = arm(slime);
+    out.slime1 = snap(slime, t, false);
+    out.slime2 = snap(slime, t, false);
+    out.slime3 = snap(slime, t, false);
+    out.bossPlain = snap(boss, arm(boss), false);
+    out.bossBreak = snap(boss, arm(boss), true);
+    return out;
+  }, POISE_PUSH);
+
+  check(poise.kinds.bat === "none" && poise.kinds.slime === "windup" && poise.kinds.boss === "full",
+    "三档配到位：蝙蝠 none / 史莱姆 windup / Boss full（got=" + JSON.stringify(poise.kinds) + "）");
+  check(poise.bat.telegraphing === false && poise.bat.windupCleared && poise.bat.cooling,
+    "none：任何命中都真打断（起手作废 + 进冷却）");
+  check(poise.slime1.telegraphing === true && poise.slime1.pushed === POISE_PUSH,
+    "windup：第 1 次被打只推迟 " + POISE_PUSH + "ms，不打断");
+  // pushed 是「相对同一个 base 的累计量」：arm() 只调了一次，三次命中都拿它当基准，
+  // 所以各推 260 两次之后，第 2 次读到的是 520（不是 260）。
+  check(poise.slime2.pushed === POISE_PUSH * 2 && poise.slime2.resets === 2,
+    "windup：第 2 次仍推迟，累计 " + poise.slime2.pushed + "ms");
+  check(poise.slime3.pushed === poise.slime2.pushed && poise.slime3.resets === 2,
+    "windup：第 3 次到上限不再推（这就是「推不断」与「被锁死」的区别）");
+  check(poise.bossPlain.telegraphing === true && poise.bossPlain.pushed === 0,
+    "full：普攻既不断也不推（Boss 的起手不能靠挥剑解决）");
+  check(poise.bossBreak.telegraphing === false && poise.bossBreak.windupCleared,
+    "full：带 poiseBreak 的招能打断（反击斩的立足点）");
+
+  // 十、反击斩：窗、卡、冷却，以及"真能打断霸体"的端到端
+  // 反击窗 = 无敌帧内的「敌人收招」那一记（见 damagePlayer 的无敌帧分支）：
+  // 不在无敌帧里、或不是收招，都不成立。
+  console.log("=== 反击斩（无敌帧内被收招命中）===");
+  const counter = await page.evaluate(() => {
+    const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
+    const out = {};
+    // 无敌帧内被"收招"命中一次。返回 { 掉血, 有没有起反击动作 }。
+    // 掉血不能当信号：damagePlayer 的无敌帧分支把伤害整个吃掉，有没有卡都是 0 掉血。
+    // 反击斩真正多出来的东西是「多打一记」，所以看 currentAction 有没有变成 counter。
+    const punch = (counterable) => {
+      sc.run.hp = 5000; sc.run.maxHp = 5000;
+      sc.invulnUntil = sc.time.now + 5000;
+      sc.currentAction = "swing"; sc.actionUntil = 0; // 先摆成「没在反击」，好看出这记有没有起反击
+      const before = sc.run.hp;
+      sc.damagePlayer(30, sc.playerX + 200, sc.playerY, counterable ? { counterable: true } : undefined);
+      return { hp: sc.run.hp - before, countered: sc.currentAction === "counter" };
+    };
+    sc.run.unlockedCombos = []; sc.counterReadyAt = 0;
+    out.noCard = punch(true);
+
+    sc.run.unlockedCombos = ["parryCounter"]; sc.counterReadyAt = 0;
+    out.withCard = punch(true);
+    out.actionMs = Math.round(sc.actionUntil - sc.time.now);
+    out.cdMs = Math.round(sc.counterReadyAt - sc.time.now);
+
+    out.onCooldown = punch(true); // 冷却没走完：不该再起反击
+
+    sc.run.unlockedCombos = ["parryCounter"]; sc.counterReadyAt = 0;
+    out.plainHurt = punch(false); // 卡在、冷却好、无敌帧也在，只是没带 counterable
+
+    // 端到端：把 Boss 摆到身前，起手状态拉好，真的放一记反击斩
+    const boss = sc.enemies.filter((e) => e.isBoss)[0];
+    boss.hp = 99999; boss.maxHp = 99999;
+    boss.telegraphing = true; boss.windupEnd = sc.time.now + 5000; boss.poiseResets = 0;
+    sc.playerX = boss.sprite.x - 120; sc.playerY = boss.groundY;
+    sc.run.unlockedCombos = ["parryCounter"]; sc.counterReadyAt = 0;
+    const bhp = boss.hp;
+    sc.startCounter(boss.sprite.x, boss.groundY);
+    out.bossTelegraphing = boss.telegraphing;
+    out.bossDamage = bhp - boss.hp;
+    return out;
+  });
+  check(counter.noCard.hp === 0 && counter.noCard.countered === false,
+    "没拿卡：无敌帧自己吃掉这记伤害（0 掉血），也不会起反击");
+  check(counter.withCard.hp === 0 && counter.withCard.countered === true,
+    "拿到卡：同一记收招被改判成反击（起了反击动作）");
+  check(counter.actionMs > 0 && counter.actionMs <= 300,
+    "反击作为动作进状态机（currentAction=counter，" + counter.actionMs + "ms）");
+  check(counter.cdMs > 2500, "反击进冷却（剩余 " + counter.cdMs + "ms）");
+  check(counter.onCooldown.countered === false, "冷却中再被收招命中不再起反击（冷却真的在拦）");
+  check(counter.plainHurt.countered === false, "没带 counterable 的伤害起不了反击（反击窗只认敌人收招）");
+  check(counter.bossTelegraphing === false && counter.bossDamage > 0,
+    "端到端：反击斩打断 Boss 起手并造成 " + counter.bossDamage + " 伤害");
+
+  // 十一、Boss 阶段：换档阈值是双向的，且恰好 50% 就该进狂暴（<= 语义）
+  console.log("=== Boss 阶段（50% 换档）===");
+  const ph = await page.evaluate(() => {
+    const sc = window.__YUANGI_DEBUG__.scene.getScene("dungeon");
+    const boss = sc.enemies.filter((e) => e.isBoss)[0];
+    sc.run.unlockedCombos = [];
+    sc.invulnUntil = sc.time.now + 60000;
+    boss.maxHp = 1000; boss.telegraphing = false;
+    const at = (hp) => { boss.hp = hp; sc.updateEnemies(16); return boss.phaseIndex; };
+    return { full: at(1000), above: at(510), exact: at(500), low: at(400), back: at(900) };
+  });
+  check(ph.full === 1 && ph.above === 1, "满血与 51% 都是常规档（" + ph.full + "/" + ph.above + "）");
+  check(ph.exact === 0, "恰好 50% 已进狂暴档（阈值是 hpRatio <= 0.5）");
+  check(ph.low === 0, "残血保持狂暴档");
+  check(ph.back === 1, "血量回到 50% 以上会换回常规档（换档双向，不是单次触发）");
 
   check(errs.length === 0, "无页面错误" + (errs.length ? "：" + errs.slice(0, 3).join(" | ") : ""));
   await browser.close();

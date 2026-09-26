@@ -8,6 +8,8 @@ import {
   BLOOD_HEAL_PER_HIT,
   BLOOD_MULT,
   BLOOD_RANGE,
+  BOSS_DOUBLE_HIT_MS,
+  BOSS_PHASES,
   CANCEL_TABLE,
   CHARGE_L1_ARC_DEG,
   CHARGE_L1_KNOCKBACK,
@@ -26,6 +28,12 @@ import {
   CHARGE_LEAP_MS,
   CHARGE_MOVE_SLOW,
   CHARGE_RECOVERY_MS,
+  COUNTER_ARC_DEG,
+  COUNTER_CD_MS,
+  COUNTER_KNOCKBACK,
+  COUNTER_MULT,
+  COUNTER_MS,
+  COUNTER_RANGE,
   DASH_COOLDOWN_MS,
   DASH_DURATION_MS,
   DASH_SPEED,
@@ -41,12 +49,16 @@ import {
   KNOCKBACK_SPEED,
   LEVEL_CLEAR_HEAL_RATIO,
   PLAYER_INVULN_MS,
+  POISE_WINDUP_PUSH_MS,
+  POISE_WINDUP_RESETS,
   ROOM_HEIGHT,
   ROOM_WIDTH,
   SHAKE_HIT,
   SHAKE_HURT,
   SHAKE_KILL,
   SKILL_POOL,
+  SLAM_DAMAGE_MULT,
+  SLAM_RADIUS_MULT,
   SWING_ARC_DEG,
   SWING_KNOCKBACK,
   SWING_RANGE,
@@ -58,11 +70,13 @@ import {
   THRUST_REACH,
   TOTAL_LEVELS,
   WALL_THICKNESS,
+  bossPhaseFor,
   enemyStatScale,
   lockedEdge,
   spawnPlanForLevel,
   type ActionId,
   type EnemyKindId,
+  type EnemyPoise,
   type SkillDef,
 } from '@/game/config';
 import { sfx } from '@/game/audio';
@@ -124,6 +138,12 @@ const ENEMY_ANIM_RATES: Record<EnemyKindId, number> = {
 };
 
 const ENEMY_WINDUP_MS = 520;
+
+/**
+ * 起手预警色。三处共用（起手、二连的第二次起手、白闪结束后恢复）：
+ * 之前是字面量 0xff7777 散在判定里，加一个「二连」就会出现两种红。
+ */
+const TELEGRAPH_TINT = 0xff7777;
 
 /** 击退速度的指数衰减系数（1/秒）。 */
 const KNOCK_DAMP = 9;
@@ -208,6 +228,16 @@ interface Enemy {
   /** 受击击退速度（设计基准单位/秒），指数衰减。 */
   kbX: number;
   kbY: number;
+  /** 霸体档位（抄自 ENEMY_KINDS[kind].poise）——命中结算时读它。 */
+  poise: EnemyPoise;
+  /** 本次起手已被推了几次。到 POISE_WINDUP_RESETS 就不再推，防止被普攻永久锁在起手。 */
+  poiseResets: number;
+  /** 这一轮起手还剩几次要放：>0 表示打完这下还会再红闪一次（Boss 二连）。 */
+  chainLeft: number;
+  /** 震地警示环（只有会震地的 Boss 才建），起手亮、收招灭。 */
+  slamWarn?: Phaser.GameObjects.Arc;
+  /** 当前 Boss 阶段下标：只在「换档那一帧」播反馈，不是每帧都播。 */
+  phaseIndex: number;
 }
 
 interface Bullet {
@@ -474,6 +504,8 @@ export class DungeonScene extends Phaser.Scene {
 
   // ---- 主动技：嗜血斩 / 突刺 ----
   private bloodReadyAt = 0;
+  /** 反击斩冷却：它是白送的一刀，冷却只用来防「同一轮多段攻击被连反多次」。 */
+  private counterReadyAt = 0;
   private thrustReadyAt = 0;
   private dashHitSet: Set<Enemy> = new Set();
   private thrustHitCount = 0;
@@ -1602,6 +1634,8 @@ export class DungeonScene extends Phaser.Scene {
     knockback: number,
     heavy: boolean,
     dirAngle: number,
+    /** poiseBreak：这一下算不算「能打断霸体」（目前只有反击斩传 true）。 */
+    opts?: { poiseBreak?: boolean },
   ): void {
     if (!e.sprite.active) {
       return;
@@ -1620,6 +1654,8 @@ export class DungeonScene extends Phaser.Scene {
       this.cameras.main.shake(120, heavy ? SHAKE_KILL * 2 : SHAKE_KILL);
       return;
     }
+    // 没被打死 → 结算霸体：这一下能不能断掉它正在起的手。
+    this.applyPoiseHit(e, opts?.poiseBreak === true, now);
     sfx.hit(heavy);
     const hx = e.sprite.x;
     const hy = e.groundY;
@@ -1633,10 +1669,42 @@ export class DungeonScene extends Phaser.Scene {
     e.sprite.setTint(0xffffff);
     const flashMs = heavy ? 130 : 80;
     this.time.delayedCall(flashMs, () => {
-      if (e.sprite.active && !e.telegraphing) {
-        e.sprite.setTint(ENEMY_TINTS[e.kind]);
+      if (e.sprite.active) {
+        // 白闪之后要回到「当前该有的颜色」：还在起手就是红闪，否则是本色。
+        // 旧写法是「只有不在起手才恢复本色」——于是打中一个正在起手的敌人时，
+        // 红闪预警被白闪抹掉并一直白到本轮起手结束，玩家看不到那记收招，只能靠挨打学会。
+        e.sprite.setTint(e.telegraphing ? TELEGRAPH_TINT : ENEMY_TINTS[e.kind]);
       }
     });
+  }
+
+  /**
+   * 命中时的霸体结算：这一下打断它正在起的手吗？
+   * - none：任何命中都真打断（起手作废 + 进冷却）；
+   * - windup：不打断，只把起手往后推，且最多推 POISE_WINDUP_RESETS 次；
+   * - full：普攻完全断不了，只有带 poiseBreak 的招（反击斩）能断。
+   * 只在「正在起手」时有意义：没在起手的敌人本来也没有可打断的东西。
+   */
+  private applyPoiseHit(e: Enemy, poiseBreak: boolean, now: number): void {
+    if (!e.telegraphing) {
+      return;
+    }
+    if (poiseBreak || e.poise === 'none') {
+      e.telegraphing = false;
+      e.windupEnd = 0;
+      e.slamWarn?.setVisible(false);
+      e.poiseResets = 0;
+      e.chainLeft = 0;
+      // 被打断也要付冷却：否则「打断」等于白赚一轮，高频普攻会把怪锁成不会还手的靶子。
+      e.nextAttackAt =
+        now +
+        (e.isBoss ? bossPhaseFor(e.hp / e.maxHp).attackCooldownMs : e.attackCooldownMs);
+      return;
+    }
+    if (e.poise === 'windup' && e.poiseResets < POISE_WINDUP_RESETS) {
+      e.poiseResets += 1;
+      e.windupEnd += POISE_WINDUP_PUSH_MS;
+    }
   }
 
   /**
@@ -1650,6 +1718,7 @@ export class DungeonScene extends Phaser.Scene {
     damage: number,
     knockback: number,
     heavy: boolean,
+    opts?: { poiseBreak?: boolean },
   ): number {
     const half = Phaser.Math.DegToRad(arcDeg / 2);
     let hits = 0;
@@ -1664,7 +1733,7 @@ export class DungeonScene extends Phaser.Scene {
       if (diff > half) {
         continue;
       }
-      this.damageEnemy(e, damage, knockback, heavy, Math.atan2(dy, dx));
+      this.damageEnemy(e, damage, knockback, heavy, Math.atan2(dy, dx), opts);
       hits += 1;
     }
     return hits;
@@ -2276,6 +2345,7 @@ export class DungeonScene extends Phaser.Scene {
     const ey = e.sprite.y;
     e.sprite.destroy();
     e.shadow.destroy();
+    e.slamWarn?.destroy();
     const idx = this.enemies.indexOf(e);
     if (idx >= 0) {
       this.enemies.splice(idx, 1);
@@ -2357,11 +2427,22 @@ export class DungeonScene extends Phaser.Scene {
       const dy = this.playerY - e.groundY;
       const dist = Math.hypot(dx, dy);
       const stopDist = e.radius + BASE_PLAYER.radius;
+      // Boss 的速度 / 收招间隔按阶段取：身板里那套只是基准值（对应一阶段）。
+      const phase = e.isBoss ? bossPhaseFor(e.hp / e.maxHp) : undefined;
+      if (phase && BOSS_PHASES.indexOf(phase) !== e.phaseIndex) {
+        // 换档只在这一帧播一次反馈，不是每帧都播。
+        e.phaseIndex = BOSS_PHASES.indexOf(phase);
+        sfx.kill();
+        this.cameras.main.shake(280, SHAKE_KILL * 1.6);
+        e.sprite.setTint(TELEGRAPH_TINT);
+        this.spawnPhaseText(e);
+      }
+      const moveSpeed = phase ? phase.speed : e.speed;
       if (dist > 0.001) {
         // 走到"贴身圈"就停，不再往玩家身上叠。多只敌人因此会围成一圈，而不是叠成一个点。
         const travel = Math.max(
           0,
-          Math.min(e.speed * GAME_SCALE * step, dist - stopDist),
+          Math.min(moveSpeed * GAME_SCALE * step, dist - stopDist),
         );
         const nx = e.sprite.x + (dx / dist) * travel + e.kbX * step;
         const ny = e.groundY + (dy / dist) * travel + e.kbY * step;
@@ -2410,8 +2491,21 @@ export class DungeonScene extends Phaser.Scene {
         rot = breath * 0.06;
       }
       if (e.telegraphing) {
-        sx *= 1.18;
-        sy *= 1.18;
+        // 起手可视化分档：越难打断的怪，起手要读得越「实」，因为「打断」不再是默认答案。
+        // none：只放大；windup：放大 + 高频抖动（能推但推不断）；
+        // full：放得更狠 + 抖动，外加地上一圈震地警示环，只能靠位移或反击处理。
+        if (e.poise === 'full') {
+          sx *= 1.34;
+          sy *= 1.34;
+          rot += Math.sin(now / 26) * 0.07;
+        } else if (e.poise === 'windup') {
+          sx *= 1.18;
+          sy *= 1.18;
+          rot += Math.sin(now / 34) * 0.05;
+        } else {
+          sx *= 1.18;
+          sy *= 1.18;
+        }
       }
       const base = e.baseScale;
       e.sprite.setScale(base * sx, base * sy);
@@ -2429,23 +2523,108 @@ export class DungeonScene extends Phaser.Scene {
       e.shadow.setAlpha(enemyOnPlatform ? 0.13 : 0.24);
       e.shadow.setScale(enemyOnPlatform ? 0.78 : 1);
 
+      // 震地警示环跟着 Boss 走，只在起手期间可见（收招 / 被打断时熄灭）。
+      if (e.slamWarn?.active) {
+        e.slamWarn.setPosition(e.sprite.x, e.groundY);
+        e.slamWarn.setVisible(e.telegraphing);
+      }
+
       // 留一点余量：敌人停在 stopDist 上，判定必须比它略大，否则会永远打不到玩家。
       const touching = dist < stopDist + gameUnits(24);
+      // 震地半径与警示环共用这一个表达式：看得见的圈 == 打得中的圈。
+      const slamRadius = stopDist + e.radius * SLAM_RADIUS_MULT;
       if (touching && !e.telegraphing && now >= e.nextAttackAt) {
         e.telegraphing = true;
         e.windupEnd = now + ENEMY_WINDUP_MS;
-        e.sprite.setTint(0xff7777);
+        e.sprite.setTint(TELEGRAPH_TINT);
+        e.poiseResets = 0;
+        // 二连在起手这一刻就定好「这一轮打几下」：第二下会单独再红闪一次。
+        e.chainLeft = phase?.doubleHit === true ? 1 : 0;
+        if (phase?.slam === true) {
+          this.showSlamWarning(e, slamRadius);
+        }
       }
       if (e.telegraphing && now >= e.windupEnd) {
         e.telegraphing = false;
         e.sprite.setTint(ENEMY_TINTS[e.kind]);
-        e.nextAttackAt = now + e.attackCooldownMs;
-        if (touching) {
-          this.damagePlayer(e.damage, e.sprite.x, e.groundY);
+        e.slamWarn?.setVisible(false);
+        if (phase?.slam === true) {
+          // 震地：判定远大于贴身圈，所以「退到贴身圈外」不够，得真离开这一圈。
+          if (dist <= slamRadius) {
+            this.damagePlayer(
+              Math.round(e.damage * SLAM_DAMAGE_MULT),
+              e.sprite.x,
+              e.groundY,
+              { counterable: true },
+            );
+          }
+        } else if (touching) {
+          // counterable 只在这里传 true：起手红闪不算，真会掉血的收招才算反击窗。
+          this.damagePlayer(e.damage, e.sprite.x, e.groundY, { counterable: true });
+        }
+        if (e.chainLeft > 0) {
+          // 二连：这一下打完不进冷却，立刻再红闪一次——第二下是独立的一次判定，
+          // 既能躲开，也能被反击斩接掉。
+          e.chainLeft -= 1;
+          e.telegraphing = true;
+          e.windupEnd = now + BOSS_DOUBLE_HIT_MS;
+          e.sprite.setTint(TELEGRAPH_TINT);
+          e.poiseResets = 0;
+          if (phase?.slam === true) {
+            this.showSlamWarning(e, slamRadius);
+          }
+        } else {
+          e.nextAttackAt =
+            now + (phase ? phase.attackCooldownMs : e.attackCooldownMs);
         }
       }
     }
     this.separateEnemies();
+  }
+
+  /**
+   * 震地警示环：半径和判定半径是同一个表达式算出来的，
+   * 所以「站在圈里 = 一定会吃这一下」是玩家能直接看出来的，不用靠挨打学会。
+   */
+  private showSlamWarning(e: Enemy, radius: number): void {
+    if (!e.slamWarn || !e.slamWarn.active) {
+      e.slamWarn = this.add
+        .circle(e.sprite.x, e.groundY, radius, TELEGRAPH_TINT, 0.14)
+        .setStrokeStyle(gameUnits(10), 0xffb3b3, 0.85)
+        .setDepth(9.5);
+    }
+    e.slamWarn
+      .setRadius(radius)
+      .setPosition(e.sprite.x, e.groundY)
+      .setVisible(true);
+  }
+
+  /** Boss 换档字幕：只在换档那一帧出现一次。 */
+  private spawnPhaseText(e: Enemy): void {
+    const t = addGameText(
+      this,
+      e.sprite.x,
+      e.groundY - gameUnits(280),
+      '狂暴',
+      {
+        color: '#ff5566',
+        fontFamily: FONT_FAMILY,
+        fontSize: gamePixels(96),
+        fontStyle: 'bold',
+      },
+    )
+      .setOrigin(0.5)
+      .setDepth(19);
+    t.setStroke('#3a0d14', gameUnits(9));
+    this.tweens.add({
+      targets: t,
+      y: t.y - gameUnits(80),
+      alpha: 0,
+      scale: { from: 1.5, to: 1 },
+      duration: 900,
+      ease: 'Cubic.out',
+      onComplete: () => t.destroy(),
+    });
   }
 
   /**
@@ -2506,13 +2685,27 @@ export class DungeonScene extends Phaser.Scene {
     }
   }
 
-  private damagePlayer(amount: number, fromX?: number, fromY?: number): void {
+  /**
+   * 玩家受伤结算。
+   * opts.counterable 只由「敌人收招那一下」传 true：无敌帧里吃到这一下时，
+   * 如果本局拿了反击斩，就把这次伤害改判成反击（见 tryStartCounter）。
+   */
+  private damagePlayer(
+    amount: number,
+    fromX?: number,
+    fromY?: number,
+    opts?: { counterable?: boolean },
+  ): void {
     if (this.phase !== 'playing') {
       return;
     }
     const now = this.time.now;
     // 无敌帧：没有它时，多只敌人会在同一帧各自结算一次伤害，被围住就是瞬秒。
     if (now < this.invulnUntil) {
+      // 无敌帧 + 敌人收招 = 反击窗。反击成立就完全不掉血，这一次伤害作废。
+      if (opts?.counterable === true && this.tryStartCounter(fromX, fromY)) {
+        return;
+      }
       return;
     }
     this.invulnUntil = now + PLAYER_INVULN_MS;
@@ -2551,6 +2744,102 @@ export class DungeonScene extends Phaser.Scene {
       this.playerShadow = undefined;
       this.showDeath();
     }
+  }
+
+  /**
+   * 反击斩的成立条件。返回 true 表示「这次伤害已经被改判成反击」。
+   * 两条硬条件：本局解锁了卡、冷却已好。
+   * 不查取消表：取消表管的是「玩家的按键输入能不能打断当前动作」，
+   * 而这里的触发源是敌人的收招——玩家的输入是「挨打」，没有可取消的按键。
+   */
+  private tryStartCounter(fromX?: number, fromY?: number): boolean {
+    if (this.phase !== 'playing') {
+      return false;
+    }
+    if (this.time.now < this.counterReadyAt) {
+      return false;
+    }
+    if (!this.run.unlockedCombos.includes('parryCounter')) {
+      return false;
+    }
+    this.startCounter(fromX, fromY);
+    return true;
+  }
+
+  /**
+   * 反击斩本体：朝打我那只敌人回一记大扇形，带 poiseBreak —— 唯一能打断 Boss 起手的招。
+   * 它自己也是一种「动作」，照旧 beginAction 记账，所以后摇仍可被 dash 取消。
+   */
+  private startCounter(fromX?: number, fromY?: number): void {
+    const now = this.time.now;
+    this.counterReadyAt = now + COUNTER_CD_MS;
+    // 反击方向 = 朝伤害来源；没有来源坐标时（理论上的无源伤害）退回面朝方向。
+    const angle =
+      fromX !== undefined && fromY !== undefined
+        ? Math.atan2(fromY - this.playerY, fromX - this.playerX)
+        : this.aimAngle();
+    this.facing = Math.cos(angle) < 0 ? -1 : 1;
+    // 掐掉飞行中的位移招：反击是「站定回打」，不能一边突刺一边反击。
+    this.dashUntil = 0;
+    this.thrustUntil = 0;
+    this.leapUntil = 0;
+    this.leapSlam = undefined;
+    if (this.charging) {
+      this.charging = false;
+      this.chargeLevel = 0;
+      this.chargeReadyAt = Math.max(this.chargeReadyAt, now + CHARGE_RECOVERY_MS);
+    }
+    this.beginAction('counter', now + COUNTER_MS);
+    // 反击本身再给一小段无敌：否则反完立刻被同一招的下一段（Boss 二连）收掉。
+    this.invulnUntil = Math.max(this.invulnUntil, now + COUNTER_MS + 120);
+    this.swingAngle = angle;
+    this.swingUntil = now + COUNTER_MS;
+    this.emoteState = 'attack';
+    this.emoteUntil = now + COUNTER_MS + 120;
+    sfx.counter();
+    this.spawnSlashArc(angle, COUNTER_ARC_DEG, COUNTER_RANGE, 0xffd166, true);
+    const hits = this.damageSector(
+      angle,
+      COUNTER_ARC_DEG,
+      COUNTER_RANGE,
+      Math.round(this.run.attack * COUNTER_MULT),
+      COUNTER_KNOCKBACK,
+      true,
+      { poiseBreak: true },
+    );
+    this.hitStopUntil = Math.max(this.hitStopUntil, now + HITSTOP_KILL_MS);
+    this.cameras.main.shake(140, SHAKE_KILL * 1.4);
+    if (hits > 0) {
+      this.spawnCounterText();
+    }
+  }
+
+  /** 反击成功的飘字：不和普通伤害飘字混，否则「反成了」和「打中了」在屏幕上没差别。 */
+  private spawnCounterText(): void {
+    const t = addGameText(
+      this,
+      this.playerX,
+      this.playerY - charFootLift(BASE_PLAYER.radius, 'player') - gameUnits(170),
+      '反击！',
+      {
+        color: '#ffd166',
+        fontFamily: FONT_FAMILY,
+        fontSize: gamePixels(78),
+        fontStyle: 'bold',
+      },
+    )
+      .setOrigin(0.5)
+      .setDepth(19);
+    t.setStroke('#5a3a00', gameUnits(8));
+    this.tweens.add({
+      targets: t,
+      y: t.y - gameUnits(80),
+      alpha: 0,
+      scale: { from: 1.4, to: 1 },
+      duration: 620,
+      ease: 'Cubic.out',
+      onComplete: () => t.destroy(),
+    });
   }
 
   /**
@@ -2833,6 +3122,11 @@ export class DungeonScene extends Phaser.Scene {
           groundY: y,
           kbX: 0,
           kbY: 0,
+          poise: kind.poise,
+          poiseResets: 0,
+          chainLeft: 0,
+          // 从「满血时的阶段」起算，否则 Boss 一进场就会被当成刚换过档、白播一次狂暴。
+          phaseIndex: BOSS_PHASES.indexOf(bossPhaseFor(1)),
         };
         this.enemies.push(e);
         if (e.isBoss) {
@@ -2882,6 +3176,7 @@ export class DungeonScene extends Phaser.Scene {
     for (const e of this.enemies) {
       e.sprite.destroy();
       e.shadow.destroy();
+      e.slamWarn?.destroy();
     }
     this.enemies = [];
     for (const b of this.bullets) {
